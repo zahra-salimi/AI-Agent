@@ -58,7 +58,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY is not set.")
 
-llm_name = "gpt-4o-mini"
+llm_name = "gpt-4o"
 model = ChatOpenAI(api_key=OPENAI_API_KEY, model=llm_name)
 embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY, chunk_size=100)
 
@@ -205,49 +205,89 @@ class AgentState(TypedDict):
 
 # --------------- (Nodes) --------------------------------
 def master_router_node(state: AgentState) -> dict:
-    """Acts as the central router, directing the conversation based on user intent and gathered data.
+    """
+        Acts as the central decision-making node of the business consultant agent.
 
-       This node is the primary decision-making point in the graph. It analyzes the
-       latest user message to determine the next step in the workflow. Its behavior
-       is divided into two main scenarios: handling a new conversation versus an
-       ongoing one.
+        This function analyzes the latest user message in the conversation and decides
+        what the next step in the dialogue should be. It is responsible for distinguishing
+        between a *new conversation* (first user message) and an *ongoing conversation*
+        (follow-up answers), extracting or updating business information, and routing
+        to the appropriate node.
 
-       **1. New Conversation (first user message):**
-           - It performs initial intent detection to classify the message as either
-             a "product_search" or a "consultation".
-           - If "product_search", it routes the graph to the `product_search_node`.
-           - If "consultation", it extracts initial business information, checks for
-             missing required fields (`customer_type`, `geo_location`, `online_presence`),
-             and either asks the first missing question (ending the current graph run)
-             or routes to `generate_analysis_node` if all information is present.
+        **Behavior:**
 
-       **2. Ongoing Conversation (subsequent user messages):**
-           - It performs contextual intent detection, checking if the user is answering
-             the previous question or starting a new product search.
-           - If it's a new search, it routes to `product_search_node`.
-           - If it's an answer, it extracts information relevant to the last question asked,
-             merges it with the existing `business_info`, and checks for completeness.
-           - If information is still missing, it asks the next required question and ends
-             the current run.
-           - If all information is complete, it routes to `generate_analysis_node`.
+        1. **New Conversation**
+           - Detects the user’s intent:
+             - `"consultation"` if the user is describing their business.
+             - `"product_search"` if the user is asking directly for a product.
+           - If it’s a consultation, extracts basic business info from the message.
+           - If the business type is missing or too general, it asks a clarifying question.
+           - Then, following a fixed priority (`business_type → customer_type → geo_location → online_presence`),
+             it asks the next missing question or moves to the analysis step when all information is complete.
 
-       Args:
-           state (AgentState): The current state of the conversation graph, containing
-               the full message history (`messages`).
+        2. **Ongoing Conversation**
+           - Determines whether the latest user reply is an answer to the previous question
+             or a new product-related query.
+           - If it’s a new query, routes to the `product_search` node.
+           - Otherwise, it updates existing business information with the new answer.
+           - Rechecks for missing or unclear fields and asks the next required question in order.
+           - Once all required fields are filled, it routes to `generate_analysis`.
 
-       Returns:
-           dict: A dictionary containing updates for the agent's state. Crucially,
-                 it sets the `next_node` key to determine the next step in the graph.
-                 It may also update `business_info` and append a new `SystemMessage`
-                 to the `messages` list when asking a question.
+        **Validation Rules:**
+           - The model avoids guessing: only explicitly stated information is extracted.
+           - `customer_type` is considered valid **only if** clear indicators (e.g., "B2B", "B2C", "consumer", "corporate") appear in the text.
+           - Business descriptions that are too general (like “I started a page”) trigger a clarification question.
+
+        Args:
+            state (AgentState): The current conversation state containing message history,
+                                business info, and next node metadata.
+
+        Returns:
+            dict: A dictionary update for the agent’s state containing:
+                  - Updated `business_info` (if applicable)
+                  - Appended `messages` (when a new question is asked)
+                  - The `next_node` key indicating the next step in the workflow.
     """
 
     last_message_content = state["messages"][-1].content
     is_new_conversation = len(state["messages"]) <= 1
 
+
+
+    # Consider customer_type valid only if explicit B2B/B2C or equivalent terms are found in the text
+    EXPLICIT_CT_PAT = re.compile(
+        r'\bB2B\b|\bB2C\b|مصرف[\s‌]*کننده|سازمانی|شرکتی',
+        re.IGNORECASE
+    )
+
+    def enforce_explicit_customer_type(info: BusinessInfo, source_text: str) -> BusinessInfo:
+        if info.customer_type and not EXPLICIT_CT_PAT.search(source_text or ""):
+            info.customer_type = None
+        return info
+
+    def is_general_sentence(text: str) -> bool:
+        if not text:
+            return True
+        check_prompt = f"""
+        جمله زیر را بررسی کن و فقط یکی از دو واژه را بنویس (هیچ توضیح دیگری ننویس):
+        - general
+        - specific
+        جمله: "{text}"
+        """
+        resp = model.invoke(check_prompt).content.strip().lower()
+        return "general" in resp
+
+    priority = ["business_type", "customer_type", "geo_location", "online_presence"]
+    questions_map = {
+        "business_type": "نوع کسب‌وکار شما چیه؟ چه محصول یا خدماتی ارائه می‌دین؟",
+        "customer_type": "مشتریان شما B2C (مصرف‌کننده نهایی) هستند یا B2B (سازمانی/شرکتی)؟",
+        "geo_location": "کسب‌وکار شما در چه موقعیت جغرافیایی فعالیت می‌کند؟",
+        "online_presence": "آیا وب‌سایت یا صفحه فروش فعال دارید؟"
+    }
+
     # --- Case 1: Brand new conversation ---
     if is_new_conversation:
-        # For the first message, we use a simple intent detection
+        # Intent detection: consultation vs. product search
         routing_prompt = f"""
         Analyze the user's intent from their first message.
         - If they are describing their business for consultation (e.g., "I have a shop..."), respond with "consultation".
@@ -257,42 +297,46 @@ def master_router_node(state: AgentState) -> dict:
         Intent:
         """
         response = model.invoke(routing_prompt)
-
         if "product_search" in response.content.lower():
             return {"next_node": "product_search"}
 
-        # If intent is consultation, proceed to gather info
+
         parser = model.with_structured_output(BusinessInfo)
         try:
-            extracted_info = parser.invoke(f"اطلاعات کسب‌وکار را از این متن استخراج کن: '{last_message_content}'")
+            extracted_info = parser.invoke(
+                f"""فقط اگر کاربر در متن زیر «صراحتاً» چیزی گفته همان را استخراج کن.
+اگر چیزی صریح نگفته هر کدام از فیلدها را خالی بگذار (حدس نزن).
+متن: '{last_message_content}'"""
+            )
         except Exception:
             extracted_info = BusinessInfo()
 
-        if not extracted_info.business_type:
-            extracted_info.business_type = last_message_content
 
-        missing_info_questions = []
-        if not extracted_info.customer_type:
-            missing_info_questions.append("مشتریان شما B2C هستند یا B2B؟")
-        if not extracted_info.geo_location:
-            missing_info_questions.append("کسب‌وکار شما در چه موقعیت جغرافیایی فعالیت می‌کند؟")
-        if not extracted_info.online_presence:
-            missing_info_questions.append("آیا وب‌سایت یا صفحه فروش فعال دارید؟")
-
-        if missing_info_questions:
-            next_question = missing_info_questions[0]
+        if (not extracted_info.business_type) or is_general_sentence(extracted_info.business_type) or is_general_sentence(last_message_content):
             return {
                 "business_info": extracted_info,
-                "messages": state["messages"] + [SystemMessage(content=next_question)],
+                "messages": state["messages"] + [SystemMessage(content=questions_map["business_type"])],
                 "next_node": "end"
             }
-        else:
-            return {"business_info": extracted_info, "next_node": "generate_analysis"}
+
+
+        extracted_info = enforce_explicit_customer_type(extracted_info, last_message_content)
+
+
+        for slot in priority:
+            if not getattr(extracted_info, slot, None):
+                return {
+                    "business_info": extracted_info,
+                    "messages": state["messages"] + [SystemMessage(content=questions_map[slot])],
+                    "next_node": "end"
+                }
+
+
+        return {"business_info": extracted_info, "next_node": "generate_analysis"}
 
     # --- Case 2: Ongoing conversation ---
     else:
-        # Provide context: the bot's last question and the user's new message
-        last_question = state["messages"][-2].content
+        last_question = state["messages"][-2].content if len(state["messages"]) >= 2 else ""
 
         contextual_routing_prompt = f"""
         You are a business consultant bot. Your last message to the user was a question.
@@ -308,14 +352,14 @@ def master_router_node(state: AgentState) -> dict:
         Intent:
         """
         response = model.invoke(contextual_routing_prompt)
-
-        # If the user changed the topic to search for a product, route them there
         if "product_search" in response.content.lower():
             return {"next_node": "product_search"}
 
-        # Otherwise, assume it's an answer and continue the consultation flow
+
         extraction_prompt = (
-            f"با توجه به سوال '{last_question}', اطلاعات زیر را از پاسخ کاربر '{last_message_content}' استخراج کن."
+            f"""با توجه به سوال '{last_question}', فقط اگر کاربر «صراحتاً» پاسخی داده همان را استخراج کن.
+اگر مشخص نیست، فیلد را خالی بگذار (حدس نزن).
+پاسخ کاربر: '{last_message_content}'"""
         )
         parser = model.with_structured_output(BusinessInfo)
         try:
@@ -323,35 +367,36 @@ def master_router_node(state: AgentState) -> dict:
         except Exception:
             extracted_info = BusinessInfo()
 
+
         current_info = state.get("business_info", BusinessInfo())
         updated_info_dict = current_info.model_dump()
         if extracted_info:
             for key, value in extracted_info.model_dump().items():
-                if value and not updated_info_dict.get(key):
+                if value is not None:
                     updated_info_dict[key] = value
         updated_info = BusinessInfo(**updated_info_dict)
 
-        if all([updated_info.business_type, updated_info.customer_type, updated_info.geo_location,
-                updated_info.online_presence]):
-            return {"business_info": updated_info, "next_node": "generate_analysis"}
 
-        missing_info_questions = []
-        if not updated_info.business_type:
-            missing_info_questions.append("لطفاً نوع کسب‌وکار خود را بفرمایید.")
-        if not updated_info.customer_type:
-            missing_info_questions.append("مشتریان شما B2C هستند یا B2B؟")
-        if not updated_info.geo_location:
-            missing_info_questions.append("کسب‌وکار شما در چه موقعیت جغرافیایی فعالیت می‌کند؟")
-        if not updated_info.online_presence:
-            missing_info_questions.append("آیا وب‌سایت یا صفحه فروش فعال دارید؟")
+        all_user_text = " ".join(m.content for m in state["messages"] if isinstance(m, HumanMessage))
+        updated_info = enforce_explicit_customer_type(updated_info, all_user_text)
 
-        if missing_info_questions:
-            next_question = missing_info_questions[0]
+
+        if (not updated_info.business_type) or is_general_sentence(updated_info.business_type):
             return {
                 "business_info": updated_info,
-                "messages": state["messages"] + [SystemMessage(content=next_question)],
+                "messages": state["messages"] + [SystemMessage(content="لطفاً نوع کسب‌وکار خود را دقیق‌تر بفرمایید (مثلاً: فروش لباس زنانه، طراحی سایت، آموزش سئو و ...).")],
                 "next_node": "end"
             }
+
+
+        for slot in priority:
+            if not getattr(updated_info, slot, None):
+                return {
+                    "business_info": updated_info,
+                    "messages": state["messages"] + [SystemMessage(content=questions_map[slot])],
+                    "next_node": "end"
+                }
+
 
         return {"business_info": updated_info, "next_node": "generate_analysis"}
 
