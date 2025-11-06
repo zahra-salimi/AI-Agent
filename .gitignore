@@ -1,0 +1,77 @@
+# -------------------------------
+# Python standard ignores
+# -------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.env/
+.venv/
+venv/
+ENV/
+env/
+pip-wheel-metadata/
+*.egg-info/
+dist/
+build/
+
+# -------------------------------
+# Environment and secrets
+# -------------------------------
+#.env
+#*.env
+#.env.local
+#.env.*.local
+
+# -------------------------------
+# OS / IDE files
+# -------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+
+# -------------------------------
+# Cache and temporary files
+# -------------------------------
+.cache/
+.pytest_cache/
+.ipynb_checkpoints/
+*.tmp
+*.bak
+
+# -------------------------------
+# Data and outputs
+# -------------------------------
+#data/
+#*.json
+#*.csv
+#*.db
+#*.sqlite
+#*.pkl
+#*.faiss
+
+# -------------------------------
+# LangChain / FAISS / Embeddings
+# -------------------------------
+*.faiss
+*.npy
+*.npz
+
+# -------------------------------
+# Reports and artifacts
+# -------------------------------
+*.pdf
+*.docx
+*.pptx
+*.xlsx
+outputs/
+logs/
+checkpoints/
+
+# -------------------------------
+# Jupyter
+# -------------------------------
+*.ipynb_checkpoints
